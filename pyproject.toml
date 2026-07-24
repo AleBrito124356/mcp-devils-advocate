@@ -1,0 +1,12 @@
+[project]
+name = "mcp-devils-advocate"
+version = "0.1.0"
+description = "MCP server that stress-tests reasoning — devil's advocate, premortem analysis, assumption audits and steelmanning as enforced, structured protocols."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Alejandro Brito", email = "alejandrobritoolivera@gmail.com"}]
+dependencies = ["mcp>=1.2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
