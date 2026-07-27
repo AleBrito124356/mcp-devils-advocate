@@ -12,7 +12,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from core import ReviewStore
+from .core import ReviewStore
 
 _env_dir = os.environ.get("DEVILS_ADVOCATE_DIR")
 DATA_DIR = Path(_env_dir) if _env_dir else Path.home() / ".mcp-devils-advocate"
@@ -122,5 +122,10 @@ def abandon_review(review_id: str, reason: str) -> dict:
     return store.abandon_review(review_id=review_id, reason=reason)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the console script."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

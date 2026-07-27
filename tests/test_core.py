@@ -1,4 +1,4 @@
-"""Tests for core.py — run with `python -m pytest`. Does NOT import mcp."""
+"""Tests for mcp_devils_advocate.core — run with `python -m pytest`. Does NOT import mcp."""
 
 import json
 import sys
@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import (  # noqa: E402
+from mcp_devils_advocate.core import (  # noqa: E402
     ASSESS_REFUTED,
     ASSESS_REVISE,
     ASSESS_SURVIVES,

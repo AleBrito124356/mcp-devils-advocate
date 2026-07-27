@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.AleBrito124356/mcp-devils-advocate",
+  "title": "Devil's Advocate",
+  "description": "Stress-test a claim: devil's advocate, premortem, assumption audits, steelmanning",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/AleBrito124356/mcp-devils-advocate",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "mcp-devils-advocate",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {"type": "stdio"},
+      "environmentVariables": [
+        {
+          "name": "DEVILS_ADVOCATE_DIR",
+          "description": "Directory where reviews are stored, one JSON file per review. Defaults to ~/.mcp-devils-advocate",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
