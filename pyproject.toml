@@ -35,7 +35,7 @@ Source = "https://github.com/AleBrito124356/mcp-devils-advocate"
 Issues = "https://github.com/AleBrito124356/mcp-devils-advocate/issues"
 
 [project.scripts]
-mcp-devils-advocate = "mcp_devils_advocate.server:main"
+mcp-devils-advocate = "mcp_devils_advocate.cli:console_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_devils_advocate"]
