@@ -1,4 +1,8 @@
-"""Tests for mcp_devils_advocate.core — run with `python -m pytest`. Does NOT import mcp."""
+"""Tests for mcp_devils_advocate.core — run with `python -m pytest`. Does NOT import mcp.
+
+Item texts come from tests/factories.py: realistic and distinct, because the
+quality gate (tested in test_quality.py) rejects junk and duplicates.
+"""
 
 import json
 import sys
@@ -16,66 +20,17 @@ from mcp_devils_advocate.core import (  # noqa: E402
     ReviewStore,
 )
 
-CLAIM = "We should rewrite our backend in Rust"
-
-LONG = "x" * 30  # meets the 30-char minimum
-SHORT = "y" * 20  # meets the 20-char minimum
-
-
-def counter(text=None, category="evidence", severity=2):
-    return {
-        "text": text or f"This counterargument is long enough to pass validation ({category}).",
-        "category": category,
-        "severity": severity,
-    }
-
-
-def rebuttal(index, verdict="refuted", justification=None):
-    return {
-        "index": index,
-        "verdict": verdict,
-        "justification": justification or "Because the data clearly says otherwise here.",
-    }
-
-
-def cause(likelihood=2, impact=2, text=None):
-    return {
-        "text": text or "A concrete failure cause with enough detail to pass.",
-        "likelihood": likelihood,
-        "impact": impact,
-    }
-
-
-def mitigation(index, residual_risk="low"):
-    return {
-        "index": index,
-        "action": "Run a two-week spike with a rollback plan before committing.",
-        "residual_risk": residual_risk,
-    }
-
-
-def assumption(load_bearing=True, evidence="none", text=None):
-    return {
-        "text": text or "The team can learn the new stack fast enough.",
-        "load_bearing": load_bearing,
-        "evidence": evidence,
-    }
-
-
-def assumption_test(index):
-    return {"index": index, "test": "Prototype the riskiest module in one afternoon."}
-
-
-def point(text=None):
-    return {"text": text or "The opposing position has this very strong argument going for it."}
-
-
-def response(index, stance="counter", text=None):
-    return {
-        "index": index,
-        "stance": stance,
-        "text": text or "Honest answer to the opposing point with substance.",
-    }
+from factories import (  # noqa: E402
+    CLAIM,
+    assumption,
+    assumption_test,
+    cause,
+    counter,
+    mitigation,
+    point,
+    rebuttal,
+    response,
+)
 
 
 @pytest.fixture()
@@ -582,3 +537,127 @@ class TestLifecycle:
         first = store.get_verdict(rid)
         second = store.get_verdict(rid)
         assert first == second
+
+
+# ---------------------------------------------------------------------------
+# 0.2.0 lifecycle fixes: final verdicts, robust listing, resume, export
+# ---------------------------------------------------------------------------
+
+
+def _complete_steelman(store):
+    rid, _ = start(store, "steelman")
+    store.submit(rid, [point(), point(), point()])
+    store.submit(rid, [response(0, stance="concede"), response(1), response(2)])
+    return rid
+
+
+class TestLifecycleV2:
+    def test_complete_review_cannot_be_abandoned(self, store):
+        rid = _complete_steelman(store)
+        with pytest.raises(ValueError, match="already complete — its verdict is final"):
+            store.abandon_review(rid, "oops")
+        # the verdict is still there
+        assert store.get_verdict(rid)["assessment"] == ASSESS_SURVIVES
+        assert store.list_reviews()["reviews"][0]["status"] == "complete"
+
+    def test_list_reviews_skips_malformed_files(self, store, tmp_path):
+        rid, _ = start(store)
+        (tmp_path / "rev-zzzz.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "rev-yyyy.json").write_text("{not json", encoding="utf-8")
+        (tmp_path / "rev-wwww.json").write_text("[1, 2]", encoding="utf-8")
+        listing = store.list_reviews()
+        assert listing["count"] == 1
+        assert listing["reviews"][0]["review_id"] == rid
+        skipped = {s["file"]: s["reason"] for s in listing["skipped"]}
+        assert skipped["rev-zzzz.json"].startswith("missing keys: id")
+        assert skipped["rev-yyyy.json"] == "unreadable (JSONDecodeError)"
+        assert skipped["rev-wwww.json"].startswith("not a JSON object")
+
+    def test_listing_without_problems_has_no_skipped_key(self, store):
+        start(store)
+        assert "skipped" not in store.list_reviews()
+
+    def test_corrupted_review_gives_a_clean_error(self, store, tmp_path):
+        (tmp_path / "rev-zzzz.json").write_text('{"id": "rev-zzzz"}', encoding="utf-8")
+        with pytest.raises(ValueError, match="corrupted on disk"):
+            store.submit("rev-zzzz", [counter()])
+        (tmp_path / "rev-yyyy.json").write_text("garbage", encoding="utf-8")
+        with pytest.raises(ValueError, match="unreadable on disk"):
+            store.get_verdict("rev-yyyy")
+
+    def test_same_second_reviews_are_listed_in_creation_order(self, tmp_path):
+        store = ReviewStore(tmp_path, clock=lambda: "2026-01-01T00:00:00+00:00")
+        ids = [store.start_review(CLAIM, "steelman")["review_id"] for _ in range(6)]
+        listed = [r["review_id"] for r in store.list_reviews()["reviews"]]
+        assert listed == list(reversed(ids))
+
+    def test_context_is_repeated_in_every_phase(self, store):
+        result = store.start_review(CLAIM, "devils_advocate", context="Budget is fixed at 2 engineers.")
+        assert result["instructions"]["context"] == "Budget is fixed at 2 engineers."
+        out = store.submit(
+            result["review_id"], [counter(severity=4), counter(category="scope"), counter(category="scope")]
+        )
+        assert out["next_phase"]["context"] == "Budget is fixed at 2 engineers."
+        assert out["next_phase"]["claim"] == CLAIM
+
+    def test_no_context_key_when_context_is_empty(self, store):
+        _, result = start(store)
+        assert "context" not in result["instructions"]
+
+    def test_get_review_for_each_status(self, store):
+        rid, _ = start(store)
+        active = store.get_review(rid)
+        assert active["status"] == "active"
+        assert active["step"] == "1/2"
+        assert active["instructions"]["phase"] == "counterarguments"
+        assert any("3 counterarguments" in m for m in active["missing"])
+
+        done = store.get_review(_complete_steelman(store))
+        assert done["status"] == "complete" and "get_verdict" in done["next"]
+        assert "instructions" not in done
+
+        rid2, _ = start(store, "premortem")
+        store.abandon_review(rid2, "scope changed")
+        gone = store.get_review(rid2)
+        assert gone["status"] == "abandoned" and gone["abandon_reason"] == "scope changed"
+
+    def test_export_report_formats(self, store):
+        rid = _complete_steelman(store)
+        md = store.export_report(rid)
+        assert md["format"] == "markdown"
+        assert md["content"].startswith(f"# Decision memo: {CLAIM}")
+        assert store.export_report(rid, "md")["content"] == md["content"]
+        js = store.export_report(rid, "json")
+        assert json.loads(js["content"]) == store.get_verdict(rid)
+        with pytest.raises(ValueError, match="Unknown format"):
+            store.export_report(rid, "pdf")
+
+    def test_export_report_requires_a_complete_review(self, store):
+        rid, _ = start(store)
+        with pytest.raises(ValueError, match="not complete"):
+            store.export_report(rid)
+
+    def test_protocol_prompt(self):
+        from mcp_devils_advocate.core import protocol_prompt
+
+        text = protocol_prompt(CLAIM, "gauntlet")
+        assert CLAIM in text and "mode='gauntlet'" in text
+        assert "counterarguments -> rebuttals -> assumptions" in text
+        with pytest.raises(ValueError, match="Unknown mode"):
+            protocol_prompt(CLAIM, "socratic")
+        with pytest.raises(ValueError, match="claim"):
+            protocol_prompt("short", "steelman")
+
+    def test_legacy_review_files_still_load(self, store, tmp_path):
+        """A review written by 0.1.0 (no created_ns) keeps working."""
+        rid, _ = start(store)
+        path = tmp_path / f"{rid}.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["created_ns"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        assert store.list_reviews()["count"] == 1
+        result = store.submit(
+            rid,
+            [counter(severity=1), counter(category="scope", severity=1), counter(category="base_rates", severity=1)],
+        )
+        assert result["status"] == "complete"

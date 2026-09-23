@@ -1,13 +1,15 @@
 """Core logic for mcp-devils-advocate.
 
 A state machine that stress-tests the reasoning of the LLM client through
-four enforced, structured protocols: devil's advocate, premortem analysis,
-assumption audit, and steelmanning.
+four enforced, structured protocols — devil's advocate, premortem analysis,
+assumption audit and steelmanning — plus ``gauntlet``, which chains all four
+on one claim and combines their verdicts.
 
 The server NEVER generates content. The client LLM does all the thinking;
 this module validates every submission against the rules of the current
-phase, refuses to advance until the phase is genuinely complete, and
-compiles the final verdict report with a documented assessment.
+phase (field formats, minimum counts, and the anti-gaming quality gate in
+``quality.py``), refuses to advance until the phase is genuinely complete,
+and compiles the final verdict report with a documented assessment.
 
 Pure Python stdlib — no external dependencies. Persistence is one JSON
 file per review inside the data directory handed to ``ReviewStore``.
@@ -20,15 +22,19 @@ import os
 import random
 import re
 import string
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from . import quality
+from .memo import render_markdown
 
 # ---------------------------------------------------------------------------
 # Protocol constants
 # ---------------------------------------------------------------------------
 
-MODES = ("devils_advocate", "premortem", "assumptions", "steelman")
+MODES = ("devils_advocate", "premortem", "assumptions", "steelman", "gauntlet")
 
 COUNTERARGUMENT_CATEGORIES = (
     "evidence",
@@ -63,6 +69,27 @@ MODE_PHASES: dict[str, tuple[str, ...]] = {
     "steelman": ("strongest_case", "responses"),
 }
 
+# The gauntlet runs every lens on the same claim: attack it, audit what it
+# silently relies on, imagine it failed, then argue the other side.
+GAUNTLET_LENSES = ("devils_advocate", "assumptions", "premortem", "steelman")
+MODE_PHASES["gauntlet"] = tuple(p for lens in GAUNTLET_LENSES for p in MODE_PHASES[lens])
+
+# Which lens each phase belongs to (used for gauntlet instructions).
+PHASE_LENS = {phase: lens for lens in GAUNTLET_LENSES for phase in MODE_PHASES[lens]}
+
+MODE_SUMMARIES = {
+    "devils_advocate": "attack the claim with categorized, severity-rated counterarguments, "
+    "then rebut the severe ones honestly",
+    "premortem": "imagine acting on the claim failed at a chosen horizon, list failure causes "
+    "(likelihood x impact), then mitigate the high-risk ones",
+    "assumptions": "surface what the claim silently relies on (load-bearing? evidence?), then "
+    "design cheap tests for the unverified load-bearing ones",
+    "steelman": "build the strongest honest case for the OPPOSING position, then concede or "
+    "counter each point",
+    "gauntlet": "all four lenses in one review (devil's advocate -> assumptions -> premortem -> "
+    "steelman) with a combined verdict",
+}
+
 # Phases whose items reference items produced by an earlier phase.
 _REFERENCE_PHASES = ("rebuttals", "mitigations", "tests", "responses")
 
@@ -71,6 +98,11 @@ ASSESS_REVISE = "claim needs revision"
 ASSESS_REFUTED = "claim refuted"
 
 _ID_PATTERN = re.compile(r"^rev-[a-z0-9]{4}$")
+
+# Keys every persisted review must have; anything else on disk is skipped.
+_REQUIRED_KEYS = ("id", "claim", "mode", "status", "phase", "phases", "created_at", "updated_at")
+
+REPORT_FORMATS = ("markdown", "md", "json")
 
 CATEGORY_MEANINGS = {
     "evidence": "the supporting evidence is weak, cherry-picked, or contradicted",
@@ -96,11 +128,11 @@ def _snippet(text: str, limit: int = 70) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _err(errors: list[str], idx: int, msg: str) -> None:
-    errors.append(f"item {idx}: {msg}")
+def _err(errors: list[tuple[int, str]], idx: int, msg: str) -> None:
+    errors.append((idx, msg))
 
 
-def _get_str(item: dict, field: str, min_len: int, errors: list[str], idx: int) -> str | None:
+def _get_str(item: dict, field: str, min_len: int, errors: list[tuple[int, str]], idx: int) -> str | None:
     value = item.get(field)
     if not isinstance(value, str) or len(value.strip()) < min_len:
         if isinstance(value, str):
@@ -114,7 +146,7 @@ def _get_str(item: dict, field: str, min_len: int, errors: list[str], idx: int) 
     return value.strip()
 
 
-def _get_choice(item: dict, field: str, choices: tuple[str, ...], errors: list[str], idx: int) -> str | None:
+def _get_choice(item: dict, field: str, choices: tuple[str, ...], errors: list[tuple[int, str]], idx: int) -> str | None:
     value = item.get(field)
     if value not in choices:
         _err(errors, idx, f"'{field}' must be one of: {', '.join(choices)} (got {value!r})")
@@ -122,7 +154,7 @@ def _get_choice(item: dict, field: str, choices: tuple[str, ...], errors: list[s
     return value
 
 
-def _get_int(item: dict, field: str, lo: int, hi: int, errors: list[str], idx: int) -> int | None:
+def _get_int(item: dict, field: str, lo: int, hi: int, errors: list[tuple[int, str]], idx: int) -> int | None:
     value = item.get(field)
     if isinstance(value, bool) or not isinstance(value, int) or not (lo <= value <= hi):
         _err(errors, idx, f"'{field}' must be an integer between {lo} and {hi} (got {value!r})")
@@ -130,7 +162,7 @@ def _get_int(item: dict, field: str, lo: int, hi: int, errors: list[str], idx: i
     return value
 
 
-def _get_bool(item: dict, field: str, errors: list[str], idx: int) -> bool | None:
+def _get_bool(item: dict, field: str, errors: list[tuple[int, str]], idx: int) -> bool | None:
     value = item.get(field)
     if not isinstance(value, bool):
         _err(errors, idx, f"'{field}' must be a boolean true/false (got {value!r})")
@@ -138,8 +170,45 @@ def _get_bool(item: dict, field: str, errors: list[str], idx: int) -> bool | Non
     return value
 
 
+
+
+def protocol_prompt(claim: str, mode: str = "devils_advocate") -> str:
+    """Instructions for an LLM to run a full review of ``claim`` with these tools.
+
+    Used by the ``stress_test`` MCP prompt; raises ValueError for an unknown mode.
+    """
+    if mode not in MODES:
+        raise ValueError(f"Unknown mode {mode!r}. Valid modes: {', '.join(MODES)}.")
+    if not isinstance(claim, str) or len(claim.strip()) < MIN_CLAIM_LENGTH:
+        raise ValueError(
+            f"'claim' must be a meaningful statement of at least {MIN_CLAIM_LENGTH} characters."
+        )
+    phases = " -> ".join(MODE_PHASES[mode])
+    return (
+        f"Stress-test this claim with the devils-advocate tools, in '{mode}' mode "
+        f"({MODE_SUMMARIES[mode]}).\n\n"
+        f"Claim: {claim.strip()}\n\n"
+        "Protocol:\n"
+        f"1. Call start_review(claim=<the claim above>, mode='{mode}', context=<any background "
+        "the user gave>). Phases: " + phases + ".\n"
+        "2. For every phase, read the returned instructions (goal, item_format, rules, "
+        "quality_checks) and send ALL items for the phase in one submit() call. Do the "
+        "thinking yourself: concrete, specific, falsifiable points — no padding, no "
+        "near-duplicates, no restating the claim, no copying the item you answer.\n"
+        "3. If submit() returns an error, nothing was saved: fix every listed item and resubmit. "
+        "If it returns 'in_progress', send what 'missing' lists.\n"
+        "4. Score honestly. Severity, likelihood x impact, load_bearing/evidence and "
+        "concede/counter decide which follow-up work is mandatory and what the verdict is. "
+        "Conceding a point you cannot counter is the honest move, not a failure.\n"
+        "5. When the review is complete, call get_verdict(review_id) and "
+        "export_report(review_id) and give the user the assessment, the reason, and the "
+        "'Next actions' checklist. Do not soften a 'claim refuted' verdict.\n"
+        "If you lose track, get_review(review_id) returns the current phase's instructions."
+    )
+
+
 # ---------------------------------------------------------------------------
-# ReviewStore — the public API used by server.py and the tests
+# ReviewStore — the public API used by server.py, cli.py and the tests
 # ---------------------------------------------------------------------------
 
 
@@ -149,14 +218,26 @@ class ReviewStore:
     ``data_dir`` is normally ``~/.mcp-devils-advocate`` or the value of the
     ``DEVILS_ADVOCATE_DIR`` environment variable (resolved by the caller,
     typically server.py, and passed in as a parameter).
+
+    ``rng`` and ``clock`` exist so the offline demo can be fully deterministic
+    (same review ids and timestamps on every run); leave them unset otherwise.
     """
 
-    def __init__(self, data_dir: str | os.PathLike | None = None) -> None:
+    def __init__(
+        self,
+        data_dir: str | os.PathLike | None = None,
+        *,
+        rng: random.Random | None = None,
+        clock: Callable[[], str] | None = None,
+    ) -> None:
         if data_dir is None:
             env = os.environ.get("DEVILS_ADVOCATE_DIR")
             data_dir = Path(env) if env else Path.home() / ".mcp-devils-advocate"
         self.data_dir = Path(data_dir).expanduser()
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._rng = rng or random.Random()
+        self._clock = clock or _utc_now
+        self._last_ns = 0
 
     # -- persistence --------------------------------------------------------
 
@@ -175,7 +256,17 @@ class ReviewStore:
                 f"Review '{review_id}' not found — call list_reviews() to see existing "
                 "reviews, or start_review() to create one."
             )
-        return json.loads(path.read_text(encoding="utf-8"))
+        try:
+            review = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            raise ValueError(
+                f"Review '{review_id}' is unreadable on disk ({type(exc).__name__}) — "
+                "start a new review."
+            ) from exc
+        problem = _structure_problem(review)
+        if problem:
+            raise ValueError(f"Review '{review_id}' is corrupted on disk ({problem}) — start a new review.")
+        return review
 
     def _save(self, review: dict) -> None:
         path = self._path(review["id"])
@@ -186,9 +277,14 @@ class ReviewStore:
     def _new_id(self) -> str:
         alphabet = string.ascii_lowercase + string.digits
         while True:
-            review_id = "rev-" + "".join(random.choices(alphabet, k=4))
+            review_id = "rev-" + "".join(self._rng.choices(alphabet, k=4))
             if not self._path(review_id).exists():
                 return review_id
+
+    def _sequence(self) -> int:
+        """Strictly increasing creation stamp — orders reviews created in the same second."""
+        self._last_ns = max(time.time_ns(), self._last_ns + 1)
+        return self._last_ns
 
     # -- tools --------------------------------------------------------------
 
@@ -201,6 +297,7 @@ class ReviewStore:
             )
         if mode not in MODES:
             raise ValueError(f"Unknown mode {mode!r}. Valid modes: {', '.join(MODES)}.")
+        now = self._clock()
         review = {
             "id": self._new_id(),
             "claim": claim.strip(),
@@ -213,8 +310,9 @@ class ReviewStore:
             "skipped_phases": [],
             "horizon": None,
             "abandon_reason": None,
-            "created_at": _utc_now(),
-            "updated_at": _utc_now(),
+            "created_at": now,
+            "created_ns": self._sequence(),
+            "updated_at": now,
         }
         self._save(review)
         return {
@@ -222,6 +320,7 @@ class ReviewStore:
             "claim": review["claim"],
             "mode": mode,
             "status": "active",
+            "phases": list(MODE_PHASES[mode]),
             "instructions": self._instructions(review),
         }
 
@@ -242,7 +341,7 @@ class ReviewStore:
         cleaned = self._validate_batch(review, items)
         current_phase = review["phase"]
         review["phases"][current_phase].extend(cleaned)
-        review["updated_at"] = _utc_now()
+        review["updated_at"] = self._clock()
 
         missing = self._completion_missing(review)
         if missing:
@@ -275,6 +374,7 @@ class ReviewStore:
             "status": "phase_complete",
             "completed_phase": current_phase,
             "accepted": len(cleaned),
+            "skipped_phases": review["skipped_phases"],
             "next_phase": self._instructions(review),
         }
 
@@ -293,13 +393,6 @@ class ReviewStore:
                 f"still needs: {'; '.join(missing)}. Use submit() to finish it."
             )
 
-        builders = {
-            "devils_advocate": self._verdict_devils_advocate,
-            "premortem": self._verdict_premortem,
-            "assumptions": self._verdict_assumptions,
-            "steelman": self._verdict_steelman,
-        }
-        phases, risk_score, assessment, reason = builders[review["mode"]](review)
         report = {
             "review_id": review["id"],
             "claim": review["claim"],
@@ -308,22 +401,88 @@ class ReviewStore:
             "created_at": review["created_at"],
             "completed_at": review["updated_at"],
             "skipped_phases": review["skipped_phases"],
-            "phases": phases,
-            "risk_score": risk_score,
-            "assessment": assessment,
-            "assessment_reason": reason,
         }
-        if review["mode"] == "premortem":
+        if review["mode"] == "gauntlet":
+            phases, risk_score, assessment, reason, lenses = self._verdict_gauntlet(review)
+            report["lenses"] = lenses
+        else:
+            phases, risk_score, assessment, reason = self._LENS_BUILDERS[review["mode"]](self, review)
+        report.update(
+            phases=phases,
+            risk_score=risk_score,
+            assessment=assessment,
+            assessment_reason=reason,
+        )
+        if review["mode"] in ("premortem", "gauntlet"):
             report["horizon"] = review["horizon"]
         return report
 
+    def export_report(self, review_id: str, format: str = "markdown") -> dict:
+        """The finished review as a shareable Markdown decision memo or as JSON."""
+        if format not in REPORT_FORMATS:
+            raise ValueError(
+                f"Unknown format {format!r}. Valid formats: markdown (alias md), json."
+            )
+        report = self.get_verdict(review_id)
+        if format == "json":
+            content = json.dumps(report, indent=2, ensure_ascii=False)
+            fmt = "json"
+        else:
+            content = render_markdown(report)
+            fmt = "markdown"
+        return {
+            "review_id": report["review_id"],
+            "format": fmt,
+            "assessment": report["assessment"],
+            "content": content,
+        }
+
+    def get_review(self, review_id: str) -> dict:
+        """Where a review stands: status, per-phase counts, and (if active) what to do next."""
+        review = self._load(review_id)
+        phases = MODE_PHASES[review["mode"]]
+        summary = {
+            "review_id": review["id"],
+            "claim": review["claim"],
+            "mode": review["mode"],
+            "context": review["context"],
+            "status": review["status"],
+            "phase": review["phase"],
+            "step": None,
+            "items_per_phase": {p: len(review["phases"].get(p, [])) for p in phases},
+            "skipped_phases": review["skipped_phases"],
+            "created_at": review["created_at"],
+            "updated_at": review["updated_at"],
+        }
+        if review["status"] == "active":
+            summary["step"] = f"{review['phase_index'] + 1}/{len(phases)}"
+            summary["missing"] = self._completion_missing(review)
+            summary["instructions"] = self._instructions(review)
+        elif review["status"] == "complete":
+            summary["next"] = (
+                f"Call get_verdict('{review['id']}') or export_report('{review['id']}')."
+            )
+        else:
+            summary["abandon_reason"] = review["abandon_reason"]
+        return summary
+
     def list_reviews(self) -> dict:
-        """Summaries of every review in the data directory (newest first)."""
+        """Summaries of every review in the data directory (newest first).
+
+        Files that are not valid reviews (corrupt JSON, missing keys) are
+        reported under ``skipped`` instead of breaking the whole listing.
+        """
         reviews = []
+        skipped = []
         for path in sorted(self.data_dir.glob("rev-*.json")):
             try:
                 review = json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+                skipped.append({"file": path.name, "reason": f"unreadable ({type(exc).__name__})"})
+                continue
+            problem = _structure_problem(review)
+            if problem:
+                skipped.append({"file": path.name, "reason": problem})
                 continue
             reviews.append(
                 {
@@ -334,13 +493,23 @@ class ReviewStore:
                     "phase": review["phase"],
                     "created_at": review["created_at"],
                     "updated_at": review["updated_at"],
+                    "_order": (review["created_at"], review.get("created_ns", 0)),
                 }
             )
-        reviews.sort(key=lambda r: r["created_at"], reverse=True)
-        return {"count": len(reviews), "reviews": reviews, "data_dir": str(self.data_dir)}
+        reviews.sort(key=lambda r: r["_order"], reverse=True)
+        for r in reviews:
+            del r["_order"]
+        result = {"count": len(reviews), "reviews": reviews, "data_dir": str(self.data_dir)}
+        if skipped:
+            result["skipped"] = skipped
+        return result
 
     def abandon_review(self, review_id: str, reason: str) -> dict:
-        """Mark a review as abandoned; it can no longer be submitted to."""
+        """Mark an unfinished review as abandoned; it can no longer be submitted to.
+
+        Completed reviews cannot be abandoned: their verdict is final and stays
+        available through get_verdict / export_report.
+        """
         review = self._load(review_id)
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError(
@@ -351,10 +520,16 @@ class ReviewStore:
                 f"Review '{review_id}' is already abandoned "
                 f"(reason: {review['abandon_reason']})."
             )
+        if review["status"] == "complete":
+            raise ValueError(
+                f"Review '{review_id}' is already complete — its verdict is final and "
+                f"cannot be abandoned. Call get_verdict('{review_id}') to read it, or start "
+                "a new review if the claim changed."
+            )
         review["status"] = "abandoned"
         review["abandon_reason"] = reason.strip()
         review["phase"] = None
-        review["updated_at"] = _utc_now()
+        review["updated_at"] = self._clock()
         self._save(review)
         return {
             "review_id": review["id"],
@@ -465,7 +640,13 @@ class ReviewStore:
     # -- batch validation ---------------------------------------------------
 
     def _validate_batch(self, review: dict, items: Any) -> list[dict]:
-        """Validate a submission atomically; raise ValueError listing every problem."""
+        """Validate a submission atomically; raise ValueError listing every problem.
+
+        Two layers: field validation (types, enums, ranges, length floors,
+        target indices), then the quality gate in ``quality.check_batch``
+        (junk text, near-duplicates, restating the claim, parroting the target)
+        on the items whose fields are valid. Nothing is saved unless both pass.
+        """
         if not isinstance(items, list) or not items:
             raise ValueError(
                 "'items' must be a non-empty list of dicts matching the current "
@@ -473,12 +654,13 @@ class ReviewStore:
                 "start_review/submit)."
             )
         phase = review["phase"]
-        errors: list[str] = []
-        cleaned: list[dict] = []
+        errors: list[tuple[int, str]] = []
+        candidates: list[tuple[int, dict]] = []
 
         pending = {i for i, _ in self._pending_targets(review, phase)} if phase in _REFERENCE_PHASES else set()
         all_targets = {i for i, _ in self._phase_targets(review, phase)} if phase in _REFERENCE_PHASES else set()
         batch_taken: set[int] = set()
+        horizon: str | None = None
 
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
@@ -490,14 +672,14 @@ class ReviewStore:
                 category = _get_choice(item, "category", COUNTERARGUMENT_CATEGORIES, errors, idx)
                 severity = _get_int(item, "severity", 1, 5, errors, idx)
                 if None not in (text, category, severity):
-                    cleaned.append({"text": text, "category": category, "severity": severity})
+                    candidates.append((idx, {"text": text, "category": category, "severity": severity}))
 
             elif phase == "rebuttals":
                 index = self._get_index(item, pending, all_targets, batch_taken, errors, idx, "counterargument")
                 verdict = _get_choice(item, "verdict", REBUTTAL_VERDICTS, errors, idx)
                 justification = _get_str(item, "justification", SHORT_TEXT_MIN, errors, idx)
                 if None not in (index, verdict, justification):
-                    cleaned.append({"index": index, "verdict": verdict, "justification": justification})
+                    candidates.append((idx, {"index": index, "verdict": verdict, "justification": justification}))
 
             elif phase == "setup":
                 if len(items) != 1 or review["phases"]["setup"]:
@@ -505,54 +687,65 @@ class ReviewStore:
                     continue
                 horizon = _get_str(item, "horizon", 2, errors, idx)
                 if horizon is not None:
-                    review["horizon"] = horizon
-                    cleaned.append({"horizon": horizon})
+                    candidates.append((idx, {"horizon": horizon}))
 
             elif phase == "failure_causes":
                 text = _get_str(item, "text", SHORT_TEXT_MIN, errors, idx)
                 likelihood = _get_int(item, "likelihood", 1, 5, errors, idx)
                 impact = _get_int(item, "impact", 1, 5, errors, idx)
                 if None not in (text, likelihood, impact):
-                    cleaned.append({"text": text, "likelihood": likelihood, "impact": impact})
+                    candidates.append((idx, {"text": text, "likelihood": likelihood, "impact": impact}))
 
             elif phase == "mitigations":
                 index = self._get_index(item, pending, all_targets, batch_taken, errors, idx, "failure cause")
                 action = _get_str(item, "action", SHORT_TEXT_MIN, errors, idx)
                 residual = _get_choice(item, "residual_risk", RESIDUAL_RISKS, errors, idx)
                 if None not in (index, action, residual):
-                    cleaned.append({"index": index, "action": action, "residual_risk": residual})
+                    candidates.append((idx, {"index": index, "action": action, "residual_risk": residual}))
 
             elif phase == "assumptions":
                 text = _get_str(item, "text", SHORT_TEXT_MIN, errors, idx)
                 load_bearing = _get_bool(item, "load_bearing", errors, idx)
                 evidence = _get_choice(item, "evidence", EVIDENCE_LEVELS, errors, idx)
                 if None not in (text, load_bearing, evidence):
-                    cleaned.append({"text": text, "load_bearing": load_bearing, "evidence": evidence})
+                    candidates.append((idx, {"text": text, "load_bearing": load_bearing, "evidence": evidence}))
 
             elif phase == "tests":
                 index = self._get_index(item, pending, all_targets, batch_taken, errors, idx, "assumption")
                 test = _get_str(item, "test", SHORT_TEXT_MIN, errors, idx)
                 if None not in (index, test):
-                    cleaned.append({"index": index, "test": test})
+                    candidates.append((idx, {"index": index, "test": test}))
 
             elif phase == "strongest_case":
                 text = _get_str(item, "text", LONG_TEXT_MIN, errors, idx)
                 if text is not None:
-                    cleaned.append({"text": text})
+                    candidates.append((idx, {"text": text}))
 
             elif phase == "responses":
                 index = self._get_index(item, pending, all_targets, batch_taken, errors, idx, "point")
                 stance = _get_choice(item, "stance", STANCES, errors, idx)
                 text = _get_str(item, "text", SHORT_TEXT_MIN, errors, idx)
                 if None not in (index, stance, text):
-                    cleaned.append({"index": index, "stance": stance, "text": text})
+                    candidates.append((idx, {"index": index, "stance": stance, "text": text}))
+
+        target_texts = (
+            {i: t["text"] for i, t in self._phase_targets(review, phase)}
+            if phase in _REFERENCE_PHASES
+            else {}
+        )
+        errors.extend(
+            quality.check_batch(phase, review["claim"], candidates, review["phases"][phase], target_texts)
+        )
 
         if errors:
+            errors.sort(key=lambda e: e[0])  # stable: keeps each item's messages in order
             raise ValueError(
                 "Invalid submission — nothing was saved. Fix these problems and resubmit:\n- "
-                + "\n- ".join(errors)
+                + "\n- ".join(f"item {idx}: {msg}" for idx, msg in errors)
             )
-        return cleaned
+        if phase == "setup" and horizon is not None:
+            review["horizon"] = horizon
+        return [item for _, item in candidates]
 
     def _get_index(
         self,
@@ -560,7 +753,7 @@ class ReviewStore:
         pending: set[int],
         all_targets: set[int],
         batch_taken: set[int],
-        errors: list[str],
+        errors: list[tuple[int, str]],
         idx: int,
         target_kind: str,
     ) -> int | None:
@@ -589,12 +782,29 @@ class ReviewStore:
     # -- phase instructions --------------------------------------------------
 
     def _instructions(self, review: dict) -> dict:
-        """Exact instructions for the current phase: what to send, format, minimums."""
+        """Exact instructions for the current phase: what to send, format, minimums.
+
+        Every phase repeats the claim and the context the client passed to
+        start_review, and lists the quality checks the submission must pass.
+        """
         phase = review["phase"]
-        base = {
+        phases = MODE_PHASES[review["mode"]]
+        base: dict[str, Any] = {
             "phase": phase,
-            "how_to_submit": f"submit(review_id='{review['id']}', items=[{{...}}, ...])",
+            "step": f"{review['phase_index'] + 1}/{len(phases)}",
+            "claim": review["claim"],
         }
+        if review.get("context"):
+            base["context"] = review["context"]
+        if review["mode"] == "gauntlet":
+            base["lens"] = PHASE_LENS[phase]
+        base["how_to_submit"] = f"submit(review_id='{review['id']}', items=[{{...}}, ...])"
+        base.update(self._phase_instructions(review, phase))
+        base["quality_checks"] = quality.rules_for(phase)
+        return base
+
+    def _phase_instructions(self, review: dict, phase: str) -> dict:
+        base: dict[str, Any] = {}
 
         if phase == "counterarguments":
             base.update(
@@ -752,7 +962,8 @@ class ReviewStore:
                 },
                 rules=[
                     f"Provide exactly one response per target ({len(targets)} pending).",
-                    "'counter' requires an actual counterargument, not a restatement of the claim.",
+                    "'counter' requires an actual counterargument, not a restatement of the claim "
+                    "(enforced — see quality_checks).",
                 ],
             )
         return base
@@ -783,6 +994,13 @@ class ReviewStore:
     #   * refuted:  every opposing point conceded
     #   * revision: concessions >= counters
     #   * survives: counters outnumber concessions
+    #
+    # gauntlet — each of the four lenses above is assessed with its own rule
+    # on the same review; risk score = 2 per refuting lens + 1 per lens that
+    # needs revision (scale 0-8).
+    #   * refuted:  >= 2 lenses refute the claim
+    #   * revision: exactly 1 lens refutes, OR >= 2 lenses need revision
+    #   * survives: otherwise
 
     def _verdict_devils_advocate(self, review: dict):
         counters = review["phases"]["counterarguments"]
@@ -954,3 +1172,61 @@ class ReviewStore:
             "explanation": "Opposing points the client had to concede.",
         }
         return {"strongest_case": organized}, risk_score, assessment, reason
+
+    def _verdict_gauntlet(self, review: dict):
+        phases: dict[str, Any] = {}
+        lenses: dict[str, dict] = {}
+        for lens in GAUNTLET_LENSES:
+            lens_phases, risk, assessment, reason = self._LENS_BUILDERS[lens](self, review)
+            phases.update(lens_phases)
+            lenses[lens] = {
+                "phases": list(MODE_PHASES[lens]),
+                "risk_score": risk,
+                "assessment": assessment,
+                "assessment_reason": reason,
+            }
+        refuting = [lens for lens, v in lenses.items() if v["assessment"] == ASSESS_REFUTED]
+        revising = [lens for lens, v in lenses.items() if v["assessment"] == ASSESS_REVISE]
+
+        if len(refuting) >= 2:
+            assessment = ASSESS_REFUTED
+        elif len(refuting) == 1 or len(revising) >= 2:
+            assessment = ASSESS_REVISE
+        else:
+            assessment = ASSESS_SURVIVES
+
+        reason = (
+            f"{len(refuting)} of {len(GAUNTLET_LENSES)} lenses refute the claim"
+            + (f" ({', '.join(refuting)})" if refuting else "")
+            + f" and {len(revising)} say it needs revision"
+            + (f" ({', '.join(revising)})" if revising else "")
+            + ". Rules: refuted if >=2 lenses refute; revision if exactly 1 lens refutes "
+            "or >=2 lenses need revision; survives otherwise."
+        )
+        risk_score = {
+            "value": 2 * len(refuting) + len(revising),
+            "scale": "0-8 (2 per refuting lens + 1 per lens needing revision)",
+            "explanation": "How many of the four lenses flagged the claim, weighted by severity.",
+        }
+        return phases, risk_score, assessment, reason, lenses
+
+    _LENS_BUILDERS: dict[str, Callable[[ReviewStore, dict], tuple]] = {
+        "devils_advocate": _verdict_devils_advocate,
+        "premortem": _verdict_premortem,
+        "assumptions": _verdict_assumptions,
+        "steelman": _verdict_steelman,
+    }
+
+
+def _structure_problem(review: Any) -> str | None:
+    """Why ``review`` is not a usable review document, or None if it is."""
+    if not isinstance(review, dict):
+        return f"not a JSON object (got {type(review).__name__})"
+    missing = [key for key in _REQUIRED_KEYS if key not in review]
+    if missing:
+        return f"missing keys: {', '.join(missing)}"
+    if review["mode"] not in MODES:
+        return f"unknown mode {review['mode']!r}"
+    if not isinstance(review["claim"], str) or not isinstance(review["phases"], dict):
+        return "malformed 'claim' or 'phases'"
+    return None
