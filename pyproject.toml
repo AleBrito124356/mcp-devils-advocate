@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-devils-advocate"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that stress-tests reasoning — devil's advocate, premortem analysis, assumption audits and steelmanning as enforced, structured protocols."
 readme = "README.md"
 requires-python = ">=3.10"
